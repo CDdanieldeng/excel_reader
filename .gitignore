@@ -1,0 +1,76 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+.ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Project specific
+# 输出目录
+outputs/
+test_data.csv
+*.xlsx
+*.xlsb
+*.csv
+
+# 日志文件（可选，如果需要保留日志可以注释掉）
+# *.log
+# *.log.txt
+# *.log.jsonl
+
+# 临时文件
+*.tmp
+*.temp
+.cache/
+
+# 配置文件（如果包含敏感信息）
+# config.ini
+# .env
+
+# 系统文件
+Thumbs.db
+.DS_Store
+
