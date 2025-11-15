@@ -56,4 +56,14 @@ class ParserConfig:
     # 日志
     log_level: LogLevel = LogLevel.INFO
     timestamp_tz: Literal["UTC"] = "UTC"
+    
+    # 性能优化参数
+    max_rows: int = 100000  # 最大读取行数，超过会截断
+    max_cols: int = 500  # 最大读取列数，超过会截断
+    max_file_size_mb: float = 100.0  # 最大文件大小（MB），超过会警告
+    enable_style_scan: bool = True  # 是否扫描样式（大文件可关闭以提升性能）
+    enable_border_scan: bool = True  # 是否扫描边框（大文件可关闭以提升性能）
+    style_scan_limit_rows: int = 10000  # 样式扫描的行数限制（只扫描前N行）
+    border_scan_limit_rows: int = 10000  # 边框扫描的行数限制（只扫描前N行）
+    process_sheets_sequentially: bool = True  # 是否逐个处理 sheet（减少内存占用）
 

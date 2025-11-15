@@ -5,13 +5,14 @@ import pandas as pd
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
-from .file_reader import read_file, detect_format
+from .file_reader import read_file, read_single_sheet, detect_format
 from .grid_builder import GridBuilder
 from .block_splitter import BlockSplitter, Block
 from .header_parser import HeaderParser
 from .cleaner import Cleaner
 from .logger import DualLogger
 from .exporter import Exporter
+from .preprocessor import FilePreprocessor
 from .models import FileFormat, TableMeta, TableScore, HeaderHierarchy, Manifest, OutputItem, WarningCode, LogLevel
 from .config import ParserConfig
 from .constants import RUN_ID_FORMAT, RUN_TS_FORMAT, DIR_LOGS
@@ -65,66 +66,126 @@ def parse_file(
     try:
         logger.log("run.start", file=Path(file_path).name, format=file_format)
         
-        # 4. 读取文件
-        sheet_data = read_file(file_path, sheet_name, file_format, config.include_hidden)
-        logger.log("file.loaded", file=Path(file_path).name, format=file_format,
-                  metrics={"sheets": list(sheet_data.keys())})
+        # 4. 预处理文件（检查大小、行数、列数等）
+        preprocessor = FilePreprocessor(config, logger)
+        preprocess_info = preprocessor.preprocess_file(file_path, file_format)
         
-        # 5. 处理每个 sheet
+        # 根据预处理结果优化配置
+        max_rows, max_cols = preprocessor.get_optimized_limits(
+            preprocess_info["estimated_rows"], 
+            preprocess_info["estimated_cols"]
+        )
+        
+        # 如果文件很大，自动优化样式和边框扫描
+        if preprocess_info["should_optimize"]:
+            if not config.enable_style_scan:
+                style_scan_limit = None
+            else:
+                style_scan_limit = config.style_scan_limit_rows
+            if not config.enable_border_scan:
+                border_scan_limit = None
+            else:
+                border_scan_limit = config.border_scan_limit_rows
+        else:
+            style_scan_limit = None
+            border_scan_limit = None
+        
+        # 5. 确定要处理的 sheet 列表
+        if file_format == FileFormat.csv:
+            sheets_to_process = ["__csv__"]
+        else:
+            sheets_to_process = sheet_name
+        
+        logger.log("file.loaded", file=Path(file_path).name, format=file_format,
+                  metrics={"sheets": sheets_to_process, "sequential": config.process_sheets_sequentially})
+        
+        # 6. 处理每个 sheet（逐个处理以减少内存占用）
         all_dfs = {}
         all_metas = {}
         df_counter = 1
         
-        for sheet_name_key, (df_raw, metadata) in sheet_data.items():
-            logger.log("grid.build", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
-                      metrics={"cells_total": df_raw.size, "nonempty": df_raw.notna().sum().sum()})
-            
-            # 构建网格
-            grid_builder = GridBuilder(df_raw, metadata, file_format)
-            O = grid_builder.build_occupancy_matrix()
-            B = grid_builder.build_border_matrix() if file_format == FileFormat.xlsx else None
-            S = grid_builder.build_style_matrix()
-            T = grid_builder.build_type_matrix()
-            merged_cells = grid_builder.get_merged_cells()
-            
-            # 分割表块
-            splitter = BlockSplitter(config, file_format)
-            blocks = splitter.split_blocks(O, B)
-            logger.log("split.blocks", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
-                      metrics={"count": len(blocks), 
-                              "sizes": [[b.height, b.width] for b in blocks]})
-            
-            if not blocks:
-                continue
-            
-            # 处理每个块
-            cleaner = Cleaner(config)
-            header_parser = HeaderParser(config, file_format)
-            scores = {}
-            header_hierarchies = {}
-            
-            # 先解析所有块的表头
-            for block in blocks:
-                header_hierarchy = header_parser.parse_headers(
-                    df_raw, block, O, S, T, merged_cells
+        for sheet_name_key in sheets_to_process:
+            # 逐个读取和处理 sheet
+            if config.process_sheets_sequentially:
+                # 逐个处理模式：读取一个，处理一个，释放内存
+                logger.log("sheet.load.start", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                          message=f"Loading sheet: {sheet_name_key}")
+                
+                df_raw, metadata = read_single_sheet(
+                    file_path, sheet_name_key, file_format, config.include_hidden,
+                    max_rows=max_rows, max_cols=max_cols,
+                    enable_style_scan=config.enable_style_scan,
+                    enable_border_scan=config.enable_border_scan,
+                    style_scan_limit=style_scan_limit,
+                    border_scan_limit=border_scan_limit
                 )
-                header_hierarchies[block.block_id] = header_hierarchy
+                
+                logger.log("sheet.load.complete", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                          metrics={"rows": len(df_raw), "cols": len(df_raw.columns)})
+            else:
+                # 批量处理模式：一次性读取所有 sheet（向后兼容）
+                if df_counter == 1:  # 只在第一次读取所有 sheet
+                    sheet_data = read_file(
+                        file_path, sheet_name, file_format, config.include_hidden,
+                        max_rows=max_rows, max_cols=max_cols,
+                        enable_style_scan=config.enable_style_scan,
+                        enable_border_scan=config.enable_border_scan,
+                        style_scan_limit=style_scan_limit,
+                        border_scan_limit=border_scan_limit
+                    )
+                df_raw, metadata = sheet_data[sheet_name_key]
             
-            # 计算每个块的评分（使用表头信息）
-            for block in blocks:
-                header_hierarchy = header_hierarchies[block.block_id]
-                score = cleaner.calculate_table_score(
-                    block, O, T, B, header_hierarchy.header_rows
-                )
-                scores[block.block_id] = score
-            
-            # 识别主表
-            main_block_id = cleaner.identify_main_table(blocks, scores)
-            
-            # 处理每个块
-            for block in blocks:
-                # 提取块数据
-                df_block = df_raw.iloc[block.r0:block.r1, block.c0:block.c1].copy()
+            # 处理当前 sheet
+            try:
+                logger.log("grid.build", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                          metrics={"cells_total": df_raw.size, "nonempty": df_raw.notna().sum().sum()})
+                
+                # 构建网格
+                grid_builder = GridBuilder(df_raw, metadata, file_format)
+                O = grid_builder.build_occupancy_matrix()
+                B = grid_builder.build_border_matrix() if file_format == FileFormat.xlsx else None
+                S = grid_builder.build_style_matrix()
+                T = grid_builder.build_type_matrix()
+                merged_cells = grid_builder.get_merged_cells()
+                
+                # 分割表块
+                splitter = BlockSplitter(config, file_format)
+                blocks = splitter.split_blocks(O, B)
+                logger.log("split.blocks", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                          metrics={"count": len(blocks), 
+                                  "sizes": [[b.height, b.width] for b in blocks]})
+                
+                if not blocks:
+                    continue
+                
+                # 处理每个块
+                cleaner = Cleaner(config)
+                header_parser = HeaderParser(config, file_format)
+                scores = {}
+                header_hierarchies = {}
+                
+                # 先解析所有块的表头
+                for block in blocks:
+                    header_hierarchy = header_parser.parse_headers(
+                        df_raw, block, O, S, T, merged_cells
+                    )
+                    header_hierarchies[block.block_id] = header_hierarchy
+                
+                # 计算每个块的评分（使用表头信息）
+                for block in blocks:
+                    header_hierarchy = header_hierarchies[block.block_id]
+                    score = cleaner.calculate_table_score(
+                        block, O, T, B, header_hierarchy.header_rows
+                    )
+                    scores[block.block_id] = score
+                
+                # 识别主表
+                main_block_id = cleaner.identify_main_table(blocks, scores)
+                
+                # 处理每个块
+                for block in blocks:
+                    # 提取块数据
+                    df_block = df_raw.iloc[block.r0:block.r1, block.c0:block.c1].copy()
                 
                 # 获取已解析的表头
                 header_hierarchy = header_hierarchies[block.block_id]
@@ -183,6 +244,35 @@ def parse_file(
                 all_dfs[df_key] = df_cleaned
                 all_metas[df_key] = meta
                 df_counter += 1
+                
+                # 逐个处理模式：释放当前 sheet 的原始数据内存
+                if config.process_sheets_sequentially:
+                    del df_block
+                    import gc
+                    gc.collect()  # 强制垃圾回收
+                
+                # 处理完所有块后，释放 sheet 原始数据
+                if config.process_sheets_sequentially and block == blocks[-1]:
+                    del df_raw, O, S, T, B
+                    import gc
+                    gc.collect()
+                    logger.log("sheet.process.complete", sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                              message=f"Sheet processed and memory released")
+            
+            except Exception as e:
+                logger.log("sheet.process.error", level=LogLevel.ERROR,
+                          sheet=sheet_name_key if sheet_name_key != "__csv__" else None,
+                          message=f"Error processing sheet: {str(e)}")
+                # 即使出错也释放内存
+                if config.process_sheets_sequentially:
+                    try:
+                        if 'df_raw' in locals():
+                            del df_raw
+                        import gc
+                        gc.collect()
+                    except:
+                        pass
+                raise
         
         # 6. 导出元数据
         if all_metas:
